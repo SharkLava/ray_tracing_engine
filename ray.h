@@ -4,9 +4,9 @@
 #include "cuda_math.h"
 #include <vector_types.h>
 
-typedef struct {
+struct alignas(16) Ray {
   float3 origin;
   float3 direction;
-} Ray;
+};
 
 #endif

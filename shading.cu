@@ -1,57 +1,60 @@
 #include "cuda_math.h"
-#include "light.h"
 #include "shading.h"
-#include <vector_types.h>
 
-__device__ float3 calculate_diffuse(Material material, Light light,
-                                    float diffuse_intensity) {
-  float3 color = multiply_float3(material.diffuse, light.color);
-  return multiply_float3_scalar(color, diffuse_intensity);
+__device__ __forceinline__ float3
+calculate_diffuse(const Material &material, const Light &light,
+                  const float diffuse_intensity) {
+  return make_float3(material.diffuse.x * light.color.x * diffuse_intensity,
+                     material.diffuse.y * light.color.y * diffuse_intensity,
+                     material.diffuse.z * light.color.z * diffuse_intensity);
 }
 
-__global__ void shade_pixels(Ray *rays, Intersection *intersections,
-                             Triangle *triangles, Material *materials,
-                             Light light, int width, int height,
-                             float3 *output_image) {
-  int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
-  int pixel_index = y * width + x;
+__global__ void shade_pixels(const Ray *__restrict__ rays,
+                             const Intersection *__restrict__ intersections,
+                             const Sphere *__restrict__ spheres,
+                             const Material *__restrict__ materials,
+                             const float3 plane_normal,
+                             const Material plane_material, const Light light,
+                             const int width, const int height,
+                             float3 *__restrict__ output_image) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height)
+    return;
 
-  if (x < width && y < height) {
-    if (intersections[pixel_index].triangle_index != -1) {
-      float3 intersection_point = make_float3(
-          rays[pixel_index].origin.x +
-              rays[pixel_index].direction.x * intersections[pixel_index].t,
-          rays[pixel_index].origin.y +
-              rays[pixel_index].direction.y * intersections[pixel_index].t,
-          rays[pixel_index].origin.z +
-              rays[pixel_index].direction.z * intersections[pixel_index].t);
+  const int pixel_index = y * width + x;
+  const Intersection &intersection = intersections[pixel_index];
+  const Ray &ray = rays[pixel_index];
 
-      Triangle triangle = triangles[intersections[pixel_index].triangle_index];
-      Material material = materials[intersections[pixel_index].triangle_index];
-
-      // Calculate surface normal
-      float3 edge1 = make_float3(triangle.v1.x - triangle.v0.x,
-                                 triangle.v1.y - triangle.v0.y,
-                                 triangle.v1.z - triangle.v0.z);
-      float3 edge2 = make_float3(triangle.v2.x - triangle.v0.x,
-                                 triangle.v2.y - triangle.v0.y,
-                                 triangle.v2.z - triangle.v0.z);
-      float3 normal = normalize(cross(edge1, edge2));
-
-      // Calculate light direction
-      float3 light_direction =
-          normalize(make_float3(light.position.x - intersection_point.x,
-                                light.position.y - intersection_point.y,
-                                light.position.z - intersection_point.z));
-
-      // Calculate diffuse intensity using dot product
-      float diffuse_intensity = max(dot(normal, light_direction), 0.0f);
-      float3 diffuse = calculate_diffuse(material, light, diffuse_intensity);
-
-      output_image[pixel_index] = add_float3(material.ambient, diffuse);
-    } else {
-      output_image[pixel_index] = make_float3(0.0f, 0.0f, 0.0f);
-    }
+  // Early exit if no intersection
+  if (intersection.t >= 1e38f) {
+    output_image[pixel_index] = make_float3(0.0f, 0.0f, 0.0f);
+    return;
   }
+
+  // Calculate intersection point
+  float3 intersection_point = ray.origin + ray.direction * intersection.t;
+  float3 normal;
+  const Material *material;
+
+  if (intersection.sphere_index != -1) {
+    const Sphere &sphere = spheres[intersection.sphere_index];
+    material = &materials[intersection.sphere_index];
+    normal = normalize(intersection_point - sphere.center);
+  } else {
+    material = &plane_material;
+    normal = plane_normal;
+  }
+
+  // Calculate lighting
+  float3 light_dir = normalize(light.position - intersection_point);
+  float diffuse_intensity = fmaxf(dot(normal, light_dir), 0.0f);
+
+  // Calculate final color
+  float3 ambient = make_float3(material->ambient.x * light.color.x,
+                               material->ambient.y * light.color.y,
+                               material->ambient.z * light.color.z);
+
+  float3 diffuse = calculate_diffuse(*material, light, diffuse_intensity);
+  output_image[pixel_index] = ambient + diffuse;
 }

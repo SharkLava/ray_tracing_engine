@@ -1,17 +1,17 @@
 #ifndef SHADING_H
 #define SHADING_H
 
-#include <vector_types.h>
-
 #include "intersection.h"
 #include "light.h"
 #include "material.h"
-#include "ray.h"
-#include "triangle.h"
 
-__global__ void shade_pixels(Ray *rays, Intersection *intersections,
-                             Triangle *triangles, Material *materials,
-                             Light light, int width, int height,
-                             float3 *output_image);
+__global__ void shade_pixels(const Ray *__restrict__ rays,
+                             const Intersection *__restrict__ intersections,
+                             const Sphere *__restrict__ spheres,
+                             const Material *__restrict__ materials,
+                             const float3 plane_normal,
+                             const Material plane_material, const Light light,
+                             const int width, const int height,
+                             float3 *__restrict__ output_image);
 
 #endif

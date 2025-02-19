@@ -2,18 +2,20 @@
 #define INTERSECTION_H
 
 #include "ray.h"
-#include "triangle.h"
+#include "sphere.h"
 #include <cuda_runtime.h>
 
-typedef struct {
+struct alignas(8) Intersection {
   float t;
-  int triangle_index;
-} Intersection;
+  int sphere_index;
+};
 
-__device__ float ray_triangle_intersection(Ray ray, Triangle triangle);
-
-__global__ void intersect_triangles(Ray *rays, Triangle *triangles,
-                                    int num_triangles, int width, int height,
-                                    Intersection *intersections);
+__global__ void intersect_spheres(const Ray *__restrict__ rays,
+                                  const Sphere *__restrict__ spheres,
+                                  const int num_spheres,
+                                  const float3 plane_normal,
+                                  const float3 plane_point, const int width,
+                                  const int height,
+                                  Intersection *__restrict__ intersections);
 
 #endif

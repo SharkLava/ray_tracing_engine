@@ -1,178 +1,131 @@
-#include <vector_types.h>
-#include <iostream>
-#include <fstream>
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include "ray.h"
-#include "triangle.h"
-#include "material.h"
-#include "intersection.h"
 #include "cuda_utils.h"
+#include "intersection.h"
 #include "ray_generation.h"
 #include "shading.h"
-#include "light.h"
-#include "cuda_math.h"
+// #include <memory>
+#include "image_utils.h"
+#include <vector>
 
-void saveImagePPM(const char* filename, float3* image, int width, int height) {
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) {
-        std::cerr << "Failed to open file: " << filename << std::endl;
-        return;
-    }
+// Launch parameters for kernels
+struct LaunchParams {
+  static constexpr int BLOCK_SIZE_X = 16;
+  static constexpr int BLOCK_SIZE_Y = 16;
 
-    // Write PPM header
-    file << "P6\n" << width << " " << height << "\n255\n";
+  static dim3 getBlockSize() { return dim3(BLOCK_SIZE_X, BLOCK_SIZE_Y); }
 
-    // Convert floating-point colors to bytes and write to file
-    for (int i = 0; i < width * height; i++) {
-        // Clamp colors to [0,1] range
-        float r = std::min(std::max(image[i].x, 0.0f), 1.0f);
-        float g = std::min(std::max(image[i].y, 0.0f), 1.0f);
-        float b = std::min(std::max(image[i].z, 0.0f), 1.0f);
+  static dim3 getGridSize(int width, int height) {
+    return dim3((width + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X,
+                (height + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y);
+  }
+};
 
-        // Convert to bytes
-        unsigned char pixel[3] = {
-            (unsigned char)(r * 255.0f),
-            (unsigned char)(g * 255.0f),
-            (unsigned char)(b * 255.0f)
-        };
+// RAII wrapper for CUDA memory
+template <typename T> class CudaBuffer {
+  T *ptr = nullptr;
+  size_t count = 0;
 
-        file.write((char*)pixel, 3);
-    }
+public:
+  CudaBuffer(size_t count) : count(count) {
+    CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(T)));
+  }
 
-    file.close();
-    std::cout << "Image saved to " << filename << std::endl;
-}
+  ~CudaBuffer() {
+    if (ptr)
+      cudaFree(ptr);
+  }
 
-int main(int argc, char** argv) {
-    // Set up image dimensions
-    const int width = 800;
-    const int height = 600;
-    
-    // Camera setup - moved closer to see the triangle better
-    float3 camera_pos = make_float3(0.0f, 0.0f, -2.0f);
-    float3 camera_dir = make_float3(0.0f, 0.0f, 1.0f);
-    float fov = 90.0f;  // Wider FOV to see more
+  T *get() { return ptr; }
+  const T *get() const { return ptr; }
+  size_t size() const { return count; }
 
-    // Create a simple triangle
-    Triangle triangle;
-    triangle.v0 = make_float3(-0.5f, -0.5f, 0.0f);  // Moved triangle closer to camera
-    triangle.v1 = make_float3(0.5f, -0.5f, 0.0f);
-    triangle.v2 = make_float3(0.0f, 0.5f, 0.0f);
+  void copyFromHost(const T *host_data) {
+    CUDA_CHECK(
+        cudaMemcpy(ptr, host_data, count * sizeof(T), cudaMemcpyHostToDevice));
+  }
 
-    // Create material with brighter colors
-    Material material;
-    material.ambient = make_float3(0.2f, 0.2f, 0.2f);  // Increased ambient
-    material.diffuse = make_float3(0.8f, 0.3f, 0.3f);  // Brighter red
-    material.specular = make_float3(1.0f, 1.0f, 1.0f);
-    material.shininess = 32.0f;
+  void copyToHost(T *host_data) const {
+    CUDA_CHECK(
+        cudaMemcpy(host_data, ptr, count * sizeof(T), cudaMemcpyDeviceToHost));
+  }
+};
 
-    // Create a light - moved to better illuminate the triangle
-    Light light;
-    light.position = make_float3(2.0f, 2.0f, -2.0f);
-    light.color = make_float3(1.0f, 1.0f, 1.0f);
+int main() {
+  const int width = 800;
+  const int height = 600;
+  constexpr int NUM_SPHERES = 2;
 
-    std::cout << "Scene setup:" << std::endl;
-    std::cout << "Triangle vertices: (" 
-              << triangle.v0.x << "," << triangle.v0.y << "," << triangle.v0.z << "), ("
-              << triangle.v1.x << "," << triangle.v1.y << "," << triangle.v1.z << "), ("
-              << triangle.v2.x << "," << triangle.v2.y << "," << triangle.v2.z << ")" << std::endl;
-    std::cout << "Camera position: (" 
-              << camera_pos.x << "," << camera_pos.y << "," << camera_pos.z << ")" << std::endl;
-    std::cout << "Light position: (" 
-              << light.position.x << "," << light.position.y << "," << light.position.z << ")" << std::endl;
+  // Create stream for asynchronous operations
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // Allocate device memory
-    Ray* d_rays;
-    Triangle* d_triangles;
-    Material* d_materials;
-    Intersection* d_intersections;
-    float3* d_output_image;
+  // Scene setup
+  float3 camera_pos = make_float3(0.0f, 0.0f, -2.0f);
+  float3 camera_dir = make_float3(0.0f, 0.0f, 1.0f);
+  float fov = 90.0f;
 
-    CUDA_CHECK(cudaMalloc(&d_rays, width * height * sizeof(Ray)));
-    CUDA_CHECK(cudaMalloc(&d_triangles, sizeof(Triangle)));
-    CUDA_CHECK(cudaMalloc(&d_materials, sizeof(Material)));
-    CUDA_CHECK(cudaMalloc(&d_intersections, width * height * sizeof(Intersection)));
-    CUDA_CHECK(cudaMalloc(&d_output_image, width * height * sizeof(float3)));
+  float3 plane_normal = make_float3(0.0f, 1.0f, 0.0f);
+  float3 plane_point = make_float3(0.0f, -0.5f, 0.0f);
 
-    // Initialize output image to a debug color to verify memory is working
-    float3 debug_color = make_float3(0.0f, 0.0f, 0.0f);
-    CUDA_CHECK(cudaMemset(d_output_image, 0, width * height * sizeof(float3)));
+  // Setup scene objects
+  std::vector<Sphere> spheres(NUM_SPHERES);
+  spheres[0] = {{0.0f, 0.5f, 0.0f}, 0.5f};
+  spheres[1] = {{0.75f, 0.0f, 0.5f}, 0.25f};
 
-    // Copy data to device
-    CUDA_CHECK(cudaMemcpy(d_triangles, &triangle, sizeof(Triangle), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_materials, &material, sizeof(Material), cudaMemcpyHostToDevice));
+  std::vector<Material> materials(NUM_SPHERES);
+  materials[0] = {
+      {0.1f, 0.0f, 0.0f}, {0.8f, 0.0f, 0.0f}, {0.2f, 0.2f, 0.2f}, 32.0f};
+  materials[1] = {
+      {0.0f, 0.1f, 0.0f}, {0.0f, 0.8f, 0.0f}, {0.2f, 0.2f, 0.2f}, 32.0f};
 
-    // Set up grid and block dimensions
-    dim3 block_size(16, 16);
-    dim3 grid_size((width + block_size.x - 1) / block_size.x, 
-                   (height + block_size.y - 1) / block_size.y);
+  Material plane_material = {
+      {0.1f, 0.1f, 0.1f}, {0.5f, 0.5f, 0.5f}, {0.0f, 0.0f, 0.0f}, 1.0f};
 
-    // Generate rays
-    generate_rays<<<grid_size, block_size>>>(camera_pos, camera_dir, fov, width, height, d_rays);
-    CUDA_CHECK(cudaGetLastError());
+  Light light = {{-1.0f, 1.0f, -1.0f}, {1.0f, 1.0f, 1.0f}};
 
-    // Debug: Copy back some rays to verify they're generated correctly
-    Ray* h_debug_rays = new Ray[10];
-    CUDA_CHECK(cudaMemcpy(h_debug_rays, d_rays, 10 * sizeof(Ray), cudaMemcpyDeviceToHost));
-    std::cout << "\nFirst few rays:" << std::endl;
-    for (int i = 0; i < 3; i++) {
-        std::cout << "Ray " << i << " origin: (" 
-                  << h_debug_rays[i].origin.x << "," 
-                  << h_debug_rays[i].origin.y << "," 
-                  << h_debug_rays[i].origin.z << ")" << std::endl;
-        std::cout << "Ray " << i << " direction: (" 
-                  << h_debug_rays[i].direction.x << "," 
-                  << h_debug_rays[i].direction.y << "," 
-                  << h_debug_rays[i].direction.z << ")" << std::endl;
-    }
-    delete[] h_debug_rays;
+  // Allocate device memory using RAII wrappers
+  CudaBuffer<Ray> d_rays(width * height);
+  CudaBuffer<Sphere> d_spheres(NUM_SPHERES);
+  CudaBuffer<Material> d_materials(NUM_SPHERES);
+  CudaBuffer<Intersection> d_intersections(width * height);
+  CudaBuffer<float3> d_output_image(width * height);
 
-    // Perform ray-triangle intersection
-    intersect_triangles<<<grid_size, block_size>>>(d_rays, d_triangles, 1, width, height, d_intersections);
-    CUDA_CHECK(cudaGetLastError());
+  // Copy data to device
+  d_spheres.copyFromHost(spheres.data());
+  d_materials.copyFromHost(materials.data());
 
-    // Debug: Check some intersections
-    Intersection* h_debug_intersections = new Intersection[10];
-    CUDA_CHECK(cudaMemcpy(h_debug_intersections, d_intersections, 10 * sizeof(Intersection), cudaMemcpyDeviceToHost));
-    std::cout << "\nFirst few intersections:" << std::endl;
-    for (int i = 0; i < 3; i++) {
-        std::cout << "Intersection " << i << ": t=" << h_debug_intersections[i].t 
-                  << ", triangle=" << h_debug_intersections[i].triangle_index << std::endl;
-    }
-    delete[] h_debug_intersections;
+  // Launch kernels
+  const dim3 blockSize = LaunchParams::getBlockSize();
+  const dim3 gridSize = LaunchParams::getGridSize(width, height);
 
-    // Shade pixels
-    shade_pixels<<<grid_size, block_size>>>(d_rays, d_intersections, d_triangles, d_materials, 
-                                          light, width, height, d_output_image);
-    CUDA_CHECK(cudaGetLastError());
+  generate_rays<<<gridSize, blockSize, 0, stream>>>(
+      camera_pos, camera_dir, fov, width, height, d_rays.get());
 
-    // Allocate host memory for the output image
-    float3* h_output_image = new float3[width * height];
+  intersect_spheres<<<gridSize, blockSize, 0, stream>>>(
+      d_rays.get(), d_spheres.get(), NUM_SPHERES, plane_normal, plane_point,
+      width, height, d_intersections.get());
 
-    // Copy result back to host
-    CUDA_CHECK(cudaMemcpy(h_output_image, d_output_image, width * height * sizeof(float3), 
-                         cudaMemcpyDeviceToHost));
+  shade_pixels<<<gridSize, blockSize, 0, stream>>>(
+      d_rays.get(), d_intersections.get(), d_spheres.get(), d_materials.get(),
+      plane_normal, plane_material, light, width, height, d_output_image.get());
 
-    // Print some pixel colors before saving
-    std::cout << "\nFirst few pixels colors:" << std::endl;
-    for (int i = 0; i < 5; i++) {
-        std::cout << "Pixel " << i << ": (" 
-                  << h_output_image[i].x << ", "
-                  << h_output_image[i].y << ", "
-                  << h_output_image[i].z << ")" << std::endl;
-    }
+  // Allocate pinned memory for output
+  float3 *h_output_image;
+  CUDA_CHECK(cudaMallocHost(&h_output_image, width * height * sizeof(float3)));
 
-    // Save the image
-    saveImagePPM("output.ppm", h_output_image, width, height);
+  // Copy result back to host asynchronously
+  CUDA_CHECK(cudaMemcpyAsync(h_output_image, d_output_image.get(),
+                             width * height * sizeof(float3),
+                             cudaMemcpyDeviceToHost, stream));
 
-    // Cleanup
-    delete[] h_output_image;
-    CUDA_CHECK(cudaFree(d_rays));
-    CUDA_CHECK(cudaFree(d_triangles));
-    CUDA_CHECK(cudaFree(d_materials));
-    CUDA_CHECK(cudaFree(d_intersections));
-    CUDA_CHECK(cudaFree(d_output_image));
+  // Wait for all operations to complete
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    return 0;
+  // Save the image
+  saveImagePPM("output.ppm", h_output_image, width, height);
+
+  // Cleanup
+  cudaFreeHost(h_output_image);
+  cudaStreamDestroy(stream);
+
+  return 0;
 }
